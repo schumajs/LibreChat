@@ -370,7 +370,7 @@ class AgentClient extends BaseClient {
    * live cost gauge reflect it. Tagged, so it is not a PRIMARY usage event
    * and cannot disturb the context-snapshot pairing in buildResponseMetadata.
    */
-  async recordActivityLabelUsage(collectedMetadata, model) {
+  async recordActivityLabelUsage(collectedMetadata, model, endpointTokenConfig) {
     const appConfig = this.options.req?.config;
     const collectedUsage = mapCollectedMetadataToUsage(collectedMetadata);
     if (collectedUsage.length === 0) {
@@ -378,19 +378,25 @@ class AgentClient extends BaseClient {
     }
     const streamId = this.options.req?._resumableStreamId || null;
     const includeCost = this.options.req?.config?.interfaceConfig?.contextCost === true;
+    /** Cross-endpoint labels (`activityEndpoint`) price with THEIR endpoint's
+     *  rates; fall back to the agent's only when the label runs there. */
+    const labelTokenConfig = endpointTokenConfig ?? this.options.endpointTokenConfig;
     for (const usage of collectedUsage) {
-      /** Label usage is billed via recordCollectedUsage but never appended to
-       *  `collectedUsage`, so `collectedUsage.length` is static here — it
-       *  would reuse the last primary usage's `runId:seq` and collide across
-       *  label calls, and the client dedupes on that pair. Use the emit
-       *  sink's length, which grows with every emitted event. */
+      /** `seq` is normally a position in `collectedUsage` (each emitter
+       *  pushes, then emits with the new length). Label usage is billed
+       *  separately and never appended there, so it has no position: any
+       *  positive value eventually collides with a real one, and the client
+       *  dedupes on `runId:seq`. Labels therefore occupy a NEGATIVE seq
+       *  namespace that positional sequences can never reach. The key is
+       *  only used for Set membership, so the sign is inert. */
+      this.activityLabelUsageSeq = (this.activityLabelUsageSeq ?? 0) + 1;
       const data = {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         model,
         usage_type: 'activity-label',
         runId: this.responseMessageId,
-        seq: (this.usageEmitSink?.length ?? 0) + this.collectedUsage.length,
+        seq: -this.activityLabelUsageSeq,
         /** Cost coverage is all-or-nothing in `aggregateEmittedUsage`: an
          *  event without `cost` suppresses the whole response's cost when
          *  `interface.contextCost` is on. */
@@ -398,7 +404,7 @@ class AgentClient extends BaseClient {
           ? computeUsageCostUSD(
               { ...usage, model },
               { getMultiplier: db.getMultiplier, getCacheMultiplier: db.getCacheMultiplier },
-              this.options.endpointTokenConfig,
+              labelTokenConfig,
             )
           : undefined,
       };
@@ -421,6 +427,7 @@ class AgentClient extends BaseClient {
       collectedUsage,
       context: 'activity-label',
       model,
+      endpointTokenConfig: labelTokenConfig,
       balance: getBalanceConfig(appConfig),
       transactions: getTransactionsConfig(appConfig),
       messageId: this.responseMessageId,
@@ -442,7 +449,7 @@ class AgentClient extends BaseClient {
     if (typeof this.run?.generateActivityLabel !== 'function') {
       return null;
     }
-    const { provider, clientOptions } = await this.resolveActivityLabelLLM();
+    const { provider, clientOptions, endpointTokenConfig } = await this.resolveActivityLabelLLM();
     const { handleLLMEnd, collected: collectedMetadata } = createMetadataAggregator();
     try {
       const { label } = await this.run.generateActivityLabel({
@@ -471,7 +478,11 @@ class AgentClient extends BaseClient {
       });
       return label ?? null;
     } finally {
-      await this.recordActivityLabelUsage(collectedMetadata, clientOptions.model);
+      await this.recordActivityLabelUsage(
+        collectedMetadata,
+        clientOptions.model,
+        endpointTokenConfig,
+      );
     }
   }
 
@@ -485,8 +496,12 @@ class AgentClient extends BaseClient {
     }
     this.pendingActivityLabelFills = [];
     await settlePendingLabelFills(pending, timeoutMs, () => {
-      this.activityLabelsClosed = true;
-      this.activityLabelAbort?.abort();
+      /** Close EVERY generation's scope: a pre-pause wiring's straggler must
+       *  stay closed even though a resume built a newer one. */
+      for (const scope of this.activityLabelScopes ?? []) {
+        scope.closed = true;
+        scope.abort.abort();
+      }
     });
   }
 
@@ -538,15 +553,19 @@ class AgentClient extends BaseClient {
     /** Label-scoped abort: fired when settle times out so a straggling
      *  generation stops burning provider time for a finalized response.
      *  Chained to the run signal so a user abort still cancels labels. */
-    this.activityLabelsClosed = false;
-    this.activityLabelAbort = new AbortController();
+    /** Close state is PER WIRING, not per client: a HITL resume rebuilds the
+     *  wiring, and resetting a shared instance flag would re-open closures
+     *  from the pre-pause segment whose provider call ignored the abort.
+     *  Scopes are retained so settle closes every generation, past included. */
+    const labelScope = { closed: false, abort: new AbortController() };
+    this.activityLabelScopes = this.activityLabelScopes ?? [];
+    this.activityLabelScopes.push(labelScope);
+    this.activityLabelAbort = labelScope.abort;
     if (abortSignal != null) {
       if (abortSignal.aborted) {
-        this.activityLabelAbort.abort();
+        labelScope.abort.abort();
       } else {
-        abortSignal.addEventListener('abort', () => this.activityLabelAbort?.abort(), {
-          once: true,
-        });
+        abortSignal.addEventListener('abort', () => labelScope.abort.abort(), { once: true });
       }
     }
     /** Thin wrapper: slot claiming, lane stamping, emit ordering, and settle
@@ -555,8 +574,8 @@ class AgentClient extends BaseClient {
       maxPerRun: activityConfig.maxPerRun,
       charLimit: activityConfig.charLimit,
       prompt: activityConfig.prompt,
-      abortSignal: this.activityLabelAbort.signal,
-      isClosed: () => this.activityLabelsClosed === true,
+      abortSignal: labelScope.abort.signal,
+      isClosed: () => labelScope.closed,
       getContentParts: () => this.contentParts,
       bumpIndexOffset: () => {
         this.steerOffsetState.offset += 1;
@@ -587,8 +606,12 @@ class AgentClient extends BaseClient {
         return {
           callbacks: [{ handleLLMEnd }],
           collect: async () => {
-            const { clientOptions } = await this.resolveActivityLabelLLM();
-            await this.recordActivityLabelUsage(collected, clientOptions.model);
+            const { clientOptions, endpointTokenConfig } = await this.resolveActivityLabelLLM();
+            await this.recordActivityLabelUsage(
+              collected,
+              clientOptions.model,
+              endpointTokenConfig,
+            );
           },
         };
       },
